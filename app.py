@@ -36,15 +36,3 @@ def clean_json_response(text):
         if lines[0].startswith("
 http://googleusercontent.com/immersive_entry_chip/0
 http://googleusercontent.com/immersive_entry_chip/1
-4. Bấm **Save** và **Reboot app**.
-
-
-
----
-**Tại sao lần này sẽ chạy?**
-* Mình đã dùng model `gemini-1.5-flash` (không dùng bản 2.0 nữa để tránh lỗi quota).
-* Mình đã thêm hàm `clean_json_response` để "gọt giũa" dữ liệu AI trả về, tránh lỗi parse JSON mà bạn hay gặp.
-
-Bạn làm đủ 3 bước này chưa? Nếu rồi thì bấm **Reboot** và thử upload file xem Gemini có "ngoan" hơn lần trước không nhé!
-
-**Bạn có muốn mình hướng dẫn cách kiểm tra xem API Key của bạn đang ở gói Free hay Pay-as-you-go để biết hạn mức sử dụng không?**
