@@ -1,6 +1,5 @@
 streamlit
 openai
-python-dotenv
-PyPDF2
 pandas
-plotly
+PyPDF2
+python-dotenv
