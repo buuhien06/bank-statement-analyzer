@@ -1,30 +1,28 @@
 import json
 import os
-
-import google.generativeai as genai
+import openai
 import pandas as pd
 import streamlit as st
 from PyPDF2 import PdfReader
 from dotenv import load_dotenv
-
 import database as db
 
-
+# 1. Cấu hình ban đầu
 load_dotenv()
-api_key = os.getenv("GEMINI_API_KEY", "").strip()
+# Ưu tiên lấy key từ Streamlit Secrets (trên web) hoặc file .env (ở máy)
+openai_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY", "").strip()
 
-if api_key:
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+if openai_key:
+    client = openai.OpenAI(api_key=openai_key)
 else:
-    model = None
+    client = None
 
 db.init_db()
 
 st.set_page_config(page_title="Bank Statement Analyzer", layout="wide")
-st.title("Personal Bank Statement Analyzer")
+st.title("💰 Personal Bank Statement Analyzer (OpenAI Edition)")
 
-
+# 2. Các hàm xử lý kỹ thuật
 def extract_pdf_text(uploaded_file):
     reader = PdfReader(uploaded_file)
     pages = []
@@ -32,123 +30,107 @@ def extract_pdf_text(uploaded_file):
         pages.append(page.extract_text() or "")
     return "\n".join(pages).strip()
 
-
-def clean_json_response(text):
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        lines = cleaned.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        cleaned = "\n".join(lines).strip()
-
-    start = cleaned.find("[")
-    end = cleaned.rfind("]")
-    if start != -1 and end != -1 and end > start:
-        cleaned = cleaned[start : end + 1]
-    return cleaned
-
-
 def analyze_transactions_with_ai(statement_text):
-    if not model:
-        raise ValueError("Thiếu GEMINI_API_KEY trong file .env.")
+    if not client:
+        raise ValueError("Chưa cấu hình OPENAI_API_KEY. Hãy kiểm tra Secrets hoặc file .env.")
 
     prompt = f"""
-Bạn là hệ thống bóc tách giao dịch ngân hàng.
-Hãy đọc nội dung sao kê bên dưới và trả về DUY NHẤT một mảng JSON hợp lệ.
+Bạn là một trợ lý tài chính chuyên nghiệp. Hãy đọc nội dung sao kê ngân hàng sau đây và trích xuất danh sách giao dịch.
+Yêu cầu trả về DUY NHẤT một mảng JSON (array of objects).
 
-Yêu cầu:
-- Mỗi phần tử là một object với các key: date, amount, description, category
-- date phải ở định dạng YYYY-MM-DD
-- amount là số nguyên
-- category là một nhãn ngắn như: Ăn uống, Lương, Mua sắm, Chuyển khoản, Di chuyển, Hóa đơn, Giải trí, Khác
-- Nếu một giao dịch là khoản chi thì amount âm
-- Nếu một giao dịch là khoản thu thì amount dương
-- Không thêm giải thích, không thêm markdown
+Mỗi giao dịch gồm:
+- date: Định dạng YYYY-MM-DD
+- amount: Số nguyên (Chi tiêu ghi số ÂM, Thu nhập ghi số DƯƠNG)
+- description: Nội dung giao dịch
+- category: Phân loại (Ăn uống, Lương, Mua sắm, Chuyển khoản, Di chuyển, Hóa đơn, Giải trí, Khác)
 
 Nội dung sao kê:
 {statement_text}
 """
-    response = model.generate_content(prompt)
-    raw_text = getattr(response, "text", "") or ""
-    if not raw_text.strip():
-        raise ValueError("Gemini không trả về nội dung để phân tích.")
 
-    json_text = clean_json_response(raw_text)
-    transactions = json.loads(json_text)
-
-    if not isinstance(transactions, list):
-        raise ValueError("Dữ liệu AI trả về không phải là một mảng JSON.")
+    # Gọi OpenAI với chế độ JSON Mode để đảm bảo không bị lỗi định dạng
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "Bạn là chuyên gia bóc tách dữ liệu sao kê sang định dạng JSON."},
+            {"role": "user", "content": prompt}
+        ],
+        response_format={ "type": "json_object" }
+    )
+    
+    raw_content = response.choices[0].message.content
+    data = json.loads(raw_content)
+    
+    # Xử lý trường hợp AI trả về object bọc ngoài (vd: {"transactions": [...]})
+    if isinstance(data, dict):
+        if "transactions" in data:
+            transactions = data["transactions"]
+        else:
+            # Lấy giá trị đầu tiên nếu nó là danh sách
+            first_val = next(iter(data.values()))
+            transactions = first_val if isinstance(first_val, list) else [data]
+    else:
+        transactions = data
 
     df = pd.DataFrame(transactions)
+    
+    # Chuẩn hóa dữ liệu để khớp với Database
     expected_columns = ["date", "amount", "description", "category"]
-    missing_columns = [column for column in expected_columns if column not in df.columns]
-    if missing_columns:
-        raise ValueError(
-            f"JSON thiếu các cột bắt buộc: {', '.join(missing_columns)}"
-        )
-
+    for col in expected_columns:
+        if col not in df.columns:
+            df[col] = 0 if col == "amount" else "N/A"
+            
     df = df[expected_columns].copy()
-    df["date"] = df["date"].astype(str).str.strip()
-    df["description"] = df["description"].astype(str).str.strip()
-    df["category"] = df["category"].fillna("Khác").astype(str).str.strip()
-    df["amount"] = pd.to_numeric(df["amount"], errors="raise").astype(int)
-
+    df["amount"] = pd.to_numeric(df["amount"], errors='coerce').fillna(0).astype(int)
+    
     if df.empty:
-        raise ValueError("Không tìm thấy giao dịch hợp lệ trong file PDF.")
-
+        raise ValueError("AI không tìm thấy giao dịch nào hợp lệ.")
+        
     return df
 
-
-tab_upload, tab_dashboard = st.tabs(["Tải dữ liệu lên", "Xem Dashboard & Thống kê"])
+# 3. Giao diện ứng dụng (Tabs)
+tab_upload, tab_dashboard = st.tabs(["📤 Tải dữ liệu lên", "📊 Xem Dashboard & Thống kê"])
 
 with tab_upload:
     st.subheader("Tải lên sao kê PDF")
-    uploaded_file = st.file_uploader("Chọn file sao kê PDF", type=["pdf"])
+    uploaded_file = st.file_uploader("Chọn file sao kê PDF (ACB, VCB, Techcombank...)", type=["pdf"])
 
-    if uploaded_file is not None:
-        st.info(f"Đã tải file: {uploaded_file.name}")
+    if uploaded_file:
+        st.info(f"📄 Đã nhận file: {uploaded_file.name}")
 
-    if st.button("Phân tích bằng AI", type="primary"):
-        if uploaded_file is None:
-            st.warning("Vui lòng tải lên một file PDF trước khi phân tích.")
+    if st.button("Phân tích bằng AI 🚀", type="primary"):
+        if not uploaded_file:
+            st.warning("Vui lòng tải lên một file PDF trước.")
         else:
             try:
-                with st.spinner("Đang đọc PDF và phân tích giao dịch bằng AI..."):
-                    statement_text = extract_pdf_text(uploaded_file)
-                    if not statement_text:
-                        raise ValueError("Không thể trích xuất nội dung văn bản từ file PDF.")
-
-                    transactions_df = analyze_transactions_with_ai(statement_text)
-                    inserted_count = db.insert_transactions(transactions_df)
-
-                st.success(
-                    f"Phân tích thành công. Đã xử lý {len(transactions_df)} giao dịch, lưu mới {inserted_count} giao dịch vào database."
-                )
-                st.dataframe(transactions_df, use_container_width=True)
-            except json.JSONDecodeError:
-                st.error("Không thể parse JSON trả về từ Gemini. Hãy thử lại với file khác hoặc prompt khác.")
-            except Exception as error:
-                st.error(f"Đã xảy ra lỗi trong quá trình phân tích: {error}")
+                with st.spinner("Đang 'đọc' sao kê bằng AI..."):
+                    text = extract_pdf_text(uploaded_file)
+                    if not text:
+                        raise ValueError("File PDF này không có nội dung văn bản để đọc.")
+                    
+                    df_result = analyze_transactions_with_ai(text)
+                    inserted = db.insert_transactions(df_result)
+                    
+                st.success(f"✅ Xong! Đã xử lý {len(df_result)} giao dịch. Lưu mới {inserted} mục vào máy.")
+                st.dataframe(df_result, use_container_width=True)
+            except Exception as e:
+                st.error(f"❌ Lỗi: {str(e)}")
 
 with tab_dashboard:
-    st.subheader("Dashboard giao dịch")
-
+    st.subheader("Thống kê chi tiêu")
     try:
-        all_transactions = db.get_all_transactions()
-        if all_transactions.empty:
-            st.info("Chưa có dữ liệu giao dịch. Hãy tải sao kê ở tab đầu tiên.")
+        data = db.get_all_transactions()
+        if data.empty:
+            st.info("Chưa có dữ liệu. Hãy quay lại Tab 1 để tải sao kê.")
         else:
-            total_income = int(all_transactions.loc[all_transactions["amount"] > 0, "amount"].sum())
-            total_expense = int(all_transactions.loc[all_transactions["amount"] < 0, "amount"].sum())
-            balance = total_income + total_expense
-
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Tổng thu", f"{total_income:,}")
-            col2.metric("Tổng chi", f"{total_expense:,}")
-            col3.metric("Số dư", f"{balance:,}")
-
-            st.dataframe(all_transactions, use_container_width=True)
-    except Exception as error:
-        st.error(f"Không thể tải dữ liệu dashboard: {error}")
+            income = int(data[data["amount"] > 0]["amount"].sum())
+            expense = int(data[data["amount"] < 0]["amount"].sum())
+            
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Tổng thu", f"{income:,}đ")
+            c2.metric("Tổng chi", f"{abs(expense):,}đ", delta_color="inverse")
+            c3.metric("Số dư", f"{income + expense:,}đ")
+            
+            st.dataframe(data.sort_values("date", ascending=False), use_container_width=True)
+    except Exception as e:
+        st.error(f"Không thể load dashboard: {e}")
